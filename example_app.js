@@ -1,38 +1,36 @@
 'use strict';
 
 /**
- * Secure demonstration app for this local express-http-proxy source tree.
+ * Secure demonstration app for express-http-proxy.
  *
  * Run:
  *   npm install
  *   PROXY_API_KEY="replace-with-a-long-random-value" node app.js
  *
- * Call:
- *   curl -H "x-api-key: replace-with-a-long-random-value" \
+ * Test:
+ *   curl \
+ *     -H "x-api-key: replace-with-a-long-random-value" \
  *     "http://127.0.0.1:3000/proxy/json?name=Agnes"
- *
- * This file starts:
- *   1. A small local upstream API on 127.0.0.1:4001
- *   2. A secured proxy API on 127.0.0.1:3000
- *
- * The upstream is fixed to localhost. Never accept a proxy host from a query
- * parameter, header, or request body because that can create SSRF.
  */
 
 const crypto = require('crypto');
 const express = require('express');
 const proxy = require('./index');
 
+const HOST = '127.0.0.1';
 const PROXY_PORT = readPort(process.env.PORT, 3000);
 const UPSTREAM_PORT = readPort(process.env.UPSTREAM_PORT, 4001);
-const HOST = '127.0.0.1';
 const API_KEY = process.env.PROXY_API_KEY;
+
 const MAX_BODY_BYTES = 64 * 1024;
+const MAX_JSON_DEPTH = 20;
 const RATE_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT = 60;
 
-if (!API_KEY || API_KEY.length < 24) {
-  console.error('PROXY_API_KEY must contain at least 24 characters.');
+if (typeof API_KEY !== 'string' || API_KEY.length < 24) {
+  console.error(
+    'PROXY_API_KEY must be set and contain at least 24 characters.'
+  );
   process.exit(1);
 }
 
@@ -46,43 +44,195 @@ function readPort(value, fallback) {
   return port;
 }
 
-function safeEqual(left, right) {
-  const leftBuffer = Buffer.from(String(left || ''), 'utf8');
-  const rightBuffer = Buffer.from(String(right || ''), 'utf8');
+/**
+ * Compares fixed-length hashes instead of comparing the original strings.
+ *
+ * Both hashes are always 32 bytes, so different API-key lengths do not cause
+ * an early return before crypto.timingSafeEqual() is called.
+ */
+function safeEqual(candidate, expected) {
+  const candidateText =
+    typeof candidate === 'string' ? candidate : '';
 
-  return (
-    leftBuffer.length === rightBuffer.length &&
-    crypto.timingSafeEqual(leftBuffer, rightBuffer)
+  const expectedText =
+    typeof expected === 'string' ? expected : '';
+
+  const candidateDigest = crypto
+    .createHash('sha256')
+    .update(candidateText, 'utf8')
+    .digest();
+
+  const expectedDigest = crypto
+    .createHash('sha256')
+    .update(expectedText, 'utf8')
+    .digest();
+
+  const hashesMatch = crypto.timingSafeEqual(
+    candidateDigest,
+    expectedDigest
   );
+
+  const inputsAreValid =
+    typeof candidate === 'string' &&
+    typeof expected === 'string' &&
+    expected.length >= 24;
+
+  return inputsAreValid && hashesMatch;
+}
+
+const FORBIDDEN_JSON_KEYS = new Set([
+  '__proto__',
+  'prototype',
+  'constructor'
+]);
+
+/**
+ * Recursively validates and copies JSON values.
+ *
+ * Dangerous property names are rejected at every nesting level, including
+ * objects inside arrays. Returned objects have no prototype.
+ */
+function sanitizeJsonValue(
+  value,
+  depth = 0,
+  seen = new WeakSet()
+) {
+  if (depth > MAX_JSON_DEPTH) {
+    throw createHttpError(
+      400,
+      'JSON body is too deeply nested'
+    );
+  }
+
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean'
+  ) {
+    return value;
+  }
+
+  if (typeof value !== 'object') {
+    throw createHttpError(
+      400,
+      'Unsupported JSON value'
+    );
+  }
+
+  if (seen.has(value)) {
+    throw createHttpError(
+      400,
+      'Circular JSON values are not allowed'
+    );
+  }
+
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    const cleanedArray = value.map((item) =>
+      sanitizeJsonValue(
+        item,
+        depth + 1,
+        seen
+      )
+    );
+
+    seen.delete(value);
+    return cleanedArray;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+
+  if (
+    prototype !== Object.prototype &&
+    prototype !== null
+  ) {
+    throw createHttpError(
+      400,
+      'Only plain JSON objects are allowed'
+    );
+  }
+
+  const cleanedObject = Object.create(null);
+
+  for (const [key, childValue] of Object.entries(value)) {
+    if (FORBIDDEN_JSON_KEYS.has(key)) {
+      throw createHttpError(
+        400,
+        'Unsafe JSON property name'
+      );
+    }
+
+    cleanedObject[key] = sanitizeJsonValue(
+      childValue,
+      depth + 1,
+      seen
+    );
+  }
+
+  seen.delete(value);
+  return cleanedObject;
+}
+
+function createHttpError(statusCode, message) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
 }
 
 function setSecurityHeaders(req, res, next) {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader(
+    'X-Content-Type-Options',
+    'nosniff'
+  );
+
+  res.setHeader(
+    'X-Frame-Options',
+    'DENY'
+  );
+
+  res.setHeader(
+    'Referrer-Policy',
+    'no-referrer'
+  );
+
   res.setHeader(
     'Permissions-Policy',
     'camera=(), microphone=(), geolocation=()'
   );
+
   res.setHeader(
     'Content-Security-Policy',
     "default-src 'none'; frame-ancestors 'none'"
   );
-  res.setHeader('Cache-Control', 'no-store');
+
+  res.setHeader(
+    'Cache-Control',
+    'no-store'
+  );
 
   next();
 }
 
 function requireApiKey(req, res, next) {
-  if (!safeEqual(req.get('x-api-key'), API_KEY)) {
+  const suppliedKey = req.get('x-api-key');
+
+  if (!safeEqual(suppliedKey, API_KEY)) {
     return res.status(401).json({
       error: 'Unauthorized'
     });
   }
 
-  next();
+  return next();
 }
 
+/**
+ * Simple in-memory rate limiter for this demonstration.
+ *
+ * A shared store such as Redis should be used when running multiple app
+ * processes or servers.
+ */
 const rateBuckets = new Map();
 
 function rateLimit(req, res, next) {
@@ -102,16 +252,32 @@ function rateLimit(req, res, next) {
 
   bucket.count += 1;
 
-  res.setHeader('RateLimit-Limit', String(RATE_LIMIT));
+  res.setHeader(
+    'RateLimit-Limit',
+    String(RATE_LIMIT)
+  );
+
   res.setHeader(
     'RateLimit-Remaining',
-    String(Math.max(0, RATE_LIMIT - bucket.count))
+    String(
+      Math.max(
+        0,
+        RATE_LIMIT - bucket.count
+      )
+    )
   );
 
   if (bucket.count > RATE_LIMIT) {
     res.setHeader(
       'Retry-After',
-      String(Math.ceil((bucket.resetAt - now) / 1000))
+      String(
+        Math.max(
+          1,
+          Math.ceil(
+            (bucket.resetAt - now) / 1000
+          )
+        )
+      )
     );
 
     return res.status(429).json({
@@ -119,7 +285,7 @@ function rateLimit(req, res, next) {
     });
   }
 
-  next();
+  return next();
 }
 
 function validateRequest(req, res, next) {
@@ -132,26 +298,54 @@ function validateRequest(req, res, next) {
   ]);
 
   if (!allowedMethods.has(req.method)) {
+    res.setHeader(
+      'Allow',
+      'GET, POST, PUT, PATCH, DELETE'
+    );
+
     return res.status(405).json({
       error: 'Method not allowed'
     });
   }
 
-  if (['POST', 'PUT', 'PATCH'].includes(req.method)) {
-    const contentType = req.get('content-type') || '';
+  if (
+    ['POST', 'PUT', 'PATCH'].includes(req.method)
+  ) {
+    const contentType =
+      req.get('content-type') || '';
 
-    if (!contentType.toLowerCase().startsWith('application/json')) {
+    if (
+      !contentType
+        .toLowerCase()
+        .startsWith('application/json')
+    ) {
       return res.status(415).json({
         error: 'Only application/json is allowed'
       });
     }
+
+    const contentLength = Number(
+      req.get('content-length')
+    );
+
+    if (
+      Number.isFinite(contentLength) &&
+      contentLength > MAX_BODY_BYTES
+    ) {
+      return res.status(413).json({
+        error: 'Body too large'
+      });
+    }
   }
 
-  next();
+  return next();
 }
 
 function cleanForwardedPath(req) {
-  const parsed = new URL(req.url, 'http://local.invalid');
+  const parsed = new URL(
+    req.url,
+    'http://local.invalid'
+  );
 
   const allowedPaths = new Set([
     '/json',
@@ -160,46 +354,60 @@ function cleanForwardedPath(req) {
   ]);
 
   if (!allowedPaths.has(parsed.pathname)) {
-    const error = new Error('Upstream path is not allowed');
-    error.statusCode = 403;
-
-    throw error;
+    throw createHttpError(
+      403,
+      'Upstream path is not allowed'
+    );
   }
 
   const output = new URLSearchParams();
 
   for (const key of ['name', 'page']) {
-    const value = parsed.searchParams.get(key);
+    const value =
+      parsed.searchParams.get(key);
 
     if (value !== null) {
-      output.set(key, value.slice(0, 100));
+      output.set(
+        key,
+        value.slice(0, 100)
+      );
     }
   }
 
   const query = output.toString();
 
-  return parsed.pathname + (query ? `?${query}` : '');
+  return (
+    parsed.pathname +
+    (query ? `?${query}` : '')
+  );
 }
 
 function proxyErrorHandler(error, res) {
-  const status = Number.isInteger(error.statusCode)
-    ? error.statusCode
-    : 502;
+  const statusCode =
+    Number.isInteger(error.statusCode) &&
+    error.statusCode >= 400 &&
+    error.statusCode <= 599
+      ? error.statusCode
+      : 502;
 
-  if (!res.headersSent) {
-    return res.status(status).json({
-      error:
-        status === 403
-          ? error.message
-          : 'Upstream request failed'
-    });
+  if (res.headersSent) {
+    return res.end();
   }
 
-  res.end();
+  const safeMessage =
+    statusCode === 400 ||
+    statusCode === 403 ||
+    statusCode === 413
+      ? error.message
+      : 'Upstream request failed';
+
+  return res.status(statusCode).json({
+    error: safeMessage
+  });
 }
 
 /*
- * Local upstream API
+ * Local demonstration upstream API
  */
 
 const upstream = express();
@@ -225,7 +433,9 @@ upstream.all('/echo', (req, res) => {
     method: req.method,
     body: req.body || null,
     receivedDemoHeader:
-      req.get('x-proxy-demo') || null
+      req.get('x-proxy-demo') || null,
+    requestId:
+      req.get('x-request-id') || null
   });
 });
 
@@ -236,7 +446,10 @@ upstream.get('/missing', (req, res) => {
 });
 
 upstream.use((error, req, res, next) => {
-  if (error && error.type === 'entity.too.large') {
+  if (
+    error &&
+    error.type === 'entity.too.large'
+  ) {
     return res.status(413).json({
       error: 'Body too large'
     });
@@ -248,14 +461,28 @@ upstream.use((error, req, res, next) => {
     });
   }
 
-  next(error);
+  return next(error);
 });
 
-upstream.listen(UPSTREAM_PORT, HOST, () => {
-  console.log(
-    `Local upstream listening on http://${HOST}:${UPSTREAM_PORT}`
-  );
+upstream.use((error, req, res, next) => {
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  return res.status(500).json({
+    error: 'Internal upstream error'
+  });
 });
+
+const upstreamServer = upstream.listen(
+  UPSTREAM_PORT,
+  HOST,
+  () => {
+    console.log(
+      `Local upstream listening on http://${HOST}:${UPSTREAM_PORT}`
+    );
+  }
+);
 
 /*
  * Secure proxy application
@@ -276,7 +503,7 @@ app.use((req, res, next) => {
     req.requestId
   );
 
-  next();
+  return next();
 });
 
 app.use(rateLimit);
@@ -292,7 +519,8 @@ app.use(
   requireApiKey,
   validateRequest,
   proxy(
-    () => `http://${HOST}:${UPSTREAM_PORT}`,
+    () =>
+      `http://${HOST}:${UPSTREAM_PORT}`,
     {
       limit: MAX_BODY_BYTES,
       timeout: 5000,
@@ -313,7 +541,10 @@ app.use(
         return cleanForwardedPath(req);
       },
 
-      proxyReqOptDecorator(proxyReqOpts, srcReq) {
+      proxyReqOptDecorator(
+        proxyReqOpts,
+        srcReq
+      ) {
         proxyReqOpts.headers =
           proxyReqOpts.headers || {};
 
@@ -324,9 +555,15 @@ app.use(
           'proxy-authorization'
         ];
         delete proxyReqOpts.headers[
+          'proxy-authenticate'
+        ];
+        delete proxyReqOpts.headers[
           'transfer-encoding'
         ];
+        delete proxyReqOpts.headers.connection;
         delete proxyReqOpts.headers.upgrade;
+        delete proxyReqOpts.headers.trailer;
+        delete proxyReqOpts.headers.te;
 
         proxyReqOpts.headers[
           'x-proxy-demo'
@@ -339,7 +576,10 @@ app.use(
         return proxyReqOpts;
       },
 
-      proxyReqBodyDecorator(bodyContent, srcReq) {
+      proxyReqBodyDecorator(
+        bodyContent,
+        srcReq
+      ) {
         if (
           !bodyContent ||
           !['POST', 'PUT', 'PATCH'].includes(
@@ -364,30 +604,18 @@ app.use(
         }
 
         if (
-          !body ||
+          body === null ||
           Array.isArray(body) ||
           typeof body !== 'object'
         ) {
-          throw new Error(
+          throw createHttpError(
+            400,
             'JSON body must be an object'
           );
         }
 
-        const cleaned = Object.create(null);
-
-        for (
-          const [key, value] of Object.entries(body)
-        ) {
-          if (
-            ![
-              '__proto__',
-              'prototype',
-              'constructor'
-            ].includes(key)
-          ) {
-            cleaned[key] = value;
-          }
-        }
+        const cleaned =
+          sanitizeJsonValue(body);
 
         cleaned.proxied = true;
 
@@ -396,27 +624,42 @@ app.use(
 
       userResHeaderDecorator(headers) {
         const safeHeaders = Object.assign(
-          {},
+          Object.create(null),
           headers
         );
 
         delete safeHeaders['set-cookie'];
         delete safeHeaders.server;
         delete safeHeaders['x-powered-by'];
+        delete safeHeaders[
+          'proxy-authenticate'
+        ];
+        delete safeHeaders[
+          'transfer-encoding'
+        ];
+        delete safeHeaders.connection;
+        delete safeHeaders.upgrade;
+        delete safeHeaders.trailer;
 
         safeHeaders['cache-control'] =
           'no-store';
 
-        safeHeaders['x-content-type-options'] =
-          'nosniff';
+        safeHeaders[
+          'x-content-type-options'
+        ] = 'nosniff';
 
         return safeHeaders;
       },
 
-      userResDecorator(proxyRes, proxyResData) {
+      userResDecorator(
+        proxyRes,
+        proxyResData
+      ) {
         const contentType = String(
-          proxyRes.headers['content-type'] || ''
-        );
+          proxyRes.headers[
+            'content-type'
+          ] || ''
+        ).toLowerCase();
 
         if (
           !contentType.includes(
@@ -430,8 +673,11 @@ app.use(
           proxyResData.toString('utf8')
         );
 
+        const cleanedResponse =
+          sanitizeJsonValue(parsed);
+
         return JSON.stringify({
-          data: parsed,
+          data: cleanedResponse,
           passedThroughProxy: true
         });
       },
@@ -465,10 +711,24 @@ app.use((error, req, res, next) => {
     });
   }
 
-  if (error instanceof SyntaxError) {
+  if (
+    error instanceof SyntaxError
+  ) {
     return res.status(400).json({
       error: 'Invalid JSON'
     });
+  }
+
+  if (
+    Number.isInteger(error.statusCode) &&
+    error.statusCode >= 400 &&
+    error.statusCode <= 499
+  ) {
+    return res
+      .status(error.statusCode)
+      .json({
+        error: error.message
+      });
   }
 
   return res.status(500).json({
@@ -476,7 +736,7 @@ app.use((error, req, res, next) => {
   });
 });
 
-const server = app.listen(
+const proxyServer = app.listen(
   PROXY_PORT,
   HOST,
   () => {
@@ -486,24 +746,41 @@ const server = app.listen(
   }
 );
 
-function shutdown(signal) {
+function closeServer(server) {
+  return new Promise((resolve) => {
+    if (!server.listening) {
+      resolve();
+      return;
+    }
+
+    server.close(() => resolve());
+  });
+}
+
+async function shutdown(signal) {
   console.log(
     `${signal} received; shutting down.`
   );
 
-  server.close(() => {
-    process.exit(0);
-  });
-
-  setTimeout(() => {
+  const forceExitTimer = setTimeout(() => {
     process.exit(1);
-  }, 5000).unref();
+  }, 5000);
+
+  forceExitTimer.unref();
+
+  await Promise.all([
+    closeServer(proxyServer),
+    closeServer(upstreamServer)
+  ]);
+
+  clearTimeout(forceExitTimer);
+  process.exit(0);
 }
 
-process.on('SIGINT', () => {
-  shutdown('SIGINT');
+process.once('SIGINT', () => {
+  void shutdown('SIGINT');
 });
 
-process.on('SIGTERM', () => {
-  shutdown('SIGTERM');
+process.once('SIGTERM', () => {
+  void shutdown('SIGTERM');
 });
