@@ -313,6 +313,16 @@ function validateRequest(req, res, next) {
     );
 
     if (
+      rawContentLength === undefined ||
+      !Number.isInteger(contentLength) ||
+      !Number.isFinite(contentLength) ||
+      contentLength < 0
+    ) {
+      return res.status(411).json({
+        error: 'Valid Content-Length required'
+      });
+    }
+    if (
       Number.isFinite(contentLength) &&
       contentLength > MAX_BODY_BYTES
     ) {
