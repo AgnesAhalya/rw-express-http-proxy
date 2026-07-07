@@ -313,7 +313,6 @@ function validateRequest(req, res, next) {
     );
 
     if (
-      rawContentLength === undefined ||
       !Number.isInteger(contentLength) ||
       !Number.isFinite(contentLength) ||
       contentLength < 0
