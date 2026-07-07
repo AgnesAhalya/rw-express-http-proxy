@@ -24,12 +24,17 @@ const API_KEY = process.env.PROXY_API_KEY;
 
 const MAX_BODY_BYTES = 64 * 1024;
 const MAX_JSON_DEPTH = 20;
+const MAX_API_KEY_BYTES = 256;
 const RATE_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT = 60;
 
-if (typeof API_KEY !== 'string' || API_KEY.length < 24) {
+if (
+  typeof API_KEY !== 'string' ||
+  API_KEY.length < 24 ||
+  Buffer.byteLength(API_KEY, 'utf8') > MAX_API_KEY_BYTES
+) {
   console.error(
-    'PROXY_API_KEY must be set and contain at least 24 characters.'
+    'PROXY_API_KEY must contain between 24 and 256 UTF-8 bytes.'
   );
   process.exit(1);
 }
@@ -44,18 +49,18 @@ function readPort(value, fallback) {
   return port;
 }
 
-/**
- * Compares fixed-length hashes instead of comparing the original strings.
- *
- * Both hashes are always 32 bytes, so different API-key lengths do not cause
- * an early return before crypto.timingSafeEqual() is called.
- */
 function safeEqual(candidate, expected) {
-  const candidateText =
-    typeof candidate === 'string' ? candidate : '';
+  const candidateIsValid =
+    typeof candidate === 'string' &&
+    Buffer.byteLength(candidate, 'utf8') <= MAX_API_KEY_BYTES;
 
-  const expectedText =
-    typeof expected === 'string' ? expected : '';
+  const expectedIsValid =
+    typeof expected === 'string' &&
+    expected.length >= 24 &&
+    Buffer.byteLength(expected, 'utf8') <= MAX_API_KEY_BYTES;
+
+  const candidateText = candidateIsValid ? candidate : '';
+  const expectedText = expectedIsValid ? expected : '';
 
   const candidateDigest = crypto
     .createHash('sha256')
@@ -72,12 +77,11 @@ function safeEqual(candidate, expected) {
     expectedDigest
   );
 
-  const inputsAreValid =
-    typeof candidate === 'string' &&
-    typeof expected === 'string' &&
-    expected.length >= 24;
-
-  return inputsAreValid && hashesMatch;
+  return (
+    candidateIsValid &&
+    expectedIsValid &&
+    hashesMatch
+  );
 }
 
 const FORBIDDEN_JSON_KEYS = new Set([
@@ -86,21 +90,16 @@ const FORBIDDEN_JSON_KEYS = new Set([
   'constructor'
 ]);
 
-/**
- * Recursively validates and copies JSON values.
- *
- * Dangerous property names are rejected at every nesting level, including
- * objects inside arrays. Returned objects have no prototype.
- */
 function sanitizeJsonValue(
   value,
+  errorStatus = 400,
   depth = 0,
   seen = new WeakSet()
 ) {
   if (depth > MAX_JSON_DEPTH) {
     throw createHttpError(
-      400,
-      'JSON body is too deeply nested'
+      errorStatus,
+      'JSON payload is too deeply nested'
     );
   }
 
@@ -115,14 +114,14 @@ function sanitizeJsonValue(
 
   if (typeof value !== 'object') {
     throw createHttpError(
-      400,
+      errorStatus,
       'Unsupported JSON value'
     );
   }
 
   if (seen.has(value)) {
     throw createHttpError(
-      400,
+      errorStatus,
       'Circular JSON values are not allowed'
     );
   }
@@ -133,6 +132,7 @@ function sanitizeJsonValue(
     const cleanedArray = value.map((item) =>
       sanitizeJsonValue(
         item,
+        errorStatus,
         depth + 1,
         seen
       )
@@ -149,7 +149,7 @@ function sanitizeJsonValue(
     prototype !== null
   ) {
     throw createHttpError(
-      400,
+      errorStatus,
       'Only plain JSON objects are allowed'
     );
   }
@@ -159,13 +159,14 @@ function sanitizeJsonValue(
   for (const [key, childValue] of Object.entries(value)) {
     if (FORBIDDEN_JSON_KEYS.has(key)) {
       throw createHttpError(
-        400,
+        errorStatus,
         'Unsafe JSON property name'
       );
     }
 
     cleanedObject[key] = sanitizeJsonValue(
       childValue,
+      errorStatus,
       depth + 1,
       seen
     );
@@ -182,35 +183,18 @@ function createHttpError(statusCode, message) {
 }
 
 function setSecurityHeaders(req, res, next) {
-  res.setHeader(
-    'X-Content-Type-Options',
-    'nosniff'
-  );
-
-  res.setHeader(
-    'X-Frame-Options',
-    'DENY'
-  );
-
-  res.setHeader(
-    'Referrer-Policy',
-    'no-referrer'
-  );
-
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader(
     'Permissions-Policy',
     'camera=(), microphone=(), geolocation=()'
   );
-
   res.setHeader(
     'Content-Security-Policy',
     "default-src 'none'; frame-ancestors 'none'"
   );
-
-  res.setHeader(
-    'Cache-Control',
-    'no-store'
-  );
+  res.setHeader('Cache-Control', 'no-store');
 
   next();
 }
@@ -227,13 +211,19 @@ function requireApiKey(req, res, next) {
   return next();
 }
 
-/**
- * Simple in-memory rate limiter for this demonstration.
- *
- * A shared store such as Redis should be used when running multiple app
- * processes or servers.
- */
 const rateBuckets = new Map();
+
+const rateBucketCleanupTimer = setInterval(() => {
+  const now = Date.now();
+
+  for (const [key, bucket] of rateBuckets.entries()) {
+    if (now >= bucket.resetAt) {
+      rateBuckets.delete(key);
+    }
+  }
+}, RATE_WINDOW_MS);
+
+rateBucketCleanupTimer.unref();
 
 function rateLimit(req, res, next) {
   const now = Date.now();
@@ -252,19 +242,10 @@ function rateLimit(req, res, next) {
 
   bucket.count += 1;
 
-  res.setHeader(
-    'RateLimit-Limit',
-    String(RATE_LIMIT)
-  );
-
+  res.setHeader('RateLimit-Limit', String(RATE_LIMIT));
   res.setHeader(
     'RateLimit-Remaining',
-    String(
-      Math.max(
-        0,
-        RATE_LIMIT - bucket.count
-      )
-    )
+    String(Math.max(0, RATE_LIMIT - bucket.count))
   );
 
   if (bucket.count > RATE_LIMIT) {
@@ -273,9 +254,7 @@ function rateLimit(req, res, next) {
       String(
         Math.max(
           1,
-          Math.ceil(
-            (bucket.resetAt - now) / 1000
-          )
+          Math.ceil((bucket.resetAt - now) / 1000)
         )
       )
     );
@@ -314,13 +293,18 @@ function validateRequest(req, res, next) {
     const contentType =
       req.get('content-type') || '';
 
-    if (
-      !contentType
-        .toLowerCase()
-        .startsWith('application/json')
-    ) {
+    const mediaType = contentType
+      .split(';', 1)[0]
+      .trim()
+      .toLowerCase();
+
+    const isJsonContentType =
+      mediaType === 'application/json' ||
+      mediaType.endsWith('+json');
+
+    if (!isJsonContentType) {
       return res.status(415).json({
-        error: 'Only application/json is allowed'
+        error: 'A JSON content type is required'
       });
     }
 
@@ -363,8 +347,7 @@ function cleanForwardedPath(req) {
   const output = new URLSearchParams();
 
   for (const key of ['name', 'page']) {
-    const value =
-      parsed.searchParams.get(key);
+    const value = parsed.searchParams.get(key);
 
     if (value !== null) {
       output.set(
@@ -405,10 +388,6 @@ function proxyErrorHandler(error, res) {
     error: safeMessage
   });
 }
-
-/*
- * Local demonstration upstream API
- */
 
 const upstream = express();
 
@@ -483,10 +462,6 @@ const upstreamServer = upstream.listen(
     );
   }
 );
-
-/*
- * Secure proxy application
- */
 
 const app = express();
 
@@ -591,16 +566,23 @@ app.use(
 
         let body;
 
-        if (Buffer.isBuffer(bodyContent)) {
-          body = JSON.parse(
-            bodyContent.toString('utf8')
+        try {
+          if (Buffer.isBuffer(bodyContent)) {
+            body = JSON.parse(
+              bodyContent.toString('utf8')
+            );
+          } else if (
+            typeof bodyContent === 'string'
+          ) {
+            body = JSON.parse(bodyContent);
+          } else {
+            body = bodyContent;
+          }
+        } catch (error) {
+          throw createHttpError(
+            400,
+            'Invalid JSON body'
           );
-        } else if (
-          typeof bodyContent === 'string'
-        ) {
-          body = JSON.parse(bodyContent);
-        } else {
-          body = bodyContent;
         }
 
         if (
@@ -615,7 +597,7 @@ app.use(
         }
 
         const cleaned =
-          sanitizeJsonValue(body);
+          sanitizeJsonValue(body, 400);
 
         cleaned.proxied = true;
 
@@ -661,20 +643,33 @@ app.use(
           ] || ''
         ).toLowerCase();
 
-        if (
-          !contentType.includes(
-            'application/json'
-          )
-        ) {
+        const mediaType = contentType
+          .split(';', 1)[0]
+          .trim();
+
+        const isJsonContentType =
+          mediaType === 'application/json' ||
+          mediaType.endsWith('+json');
+
+        if (!isJsonContentType) {
           return proxyResData;
         }
 
-        const parsed = JSON.parse(
-          proxyResData.toString('utf8')
-        );
+        let parsed;
+
+        try {
+          parsed = JSON.parse(
+            proxyResData.toString('utf8')
+          );
+        } catch (error) {
+          throw createHttpError(
+            502,
+            'Upstream returned invalid JSON'
+          );
+        }
 
         const cleanedResponse =
-          sanitizeJsonValue(parsed);
+          sanitizeJsonValue(parsed, 502);
 
         return JSON.stringify({
           data: cleanedResponse,
@@ -711,9 +706,7 @@ app.use((error, req, res, next) => {
     });
   }
 
-  if (
-    error instanceof SyntaxError
-  ) {
+  if (error instanceof SyntaxError) {
     return res.status(400).json({
       error: 'Invalid JSON'
     });
@@ -761,6 +754,9 @@ async function shutdown(signal) {
   console.log(
     `${signal} received; shutting down.`
   );
+
+  clearInterval(rateBucketCleanupTimer);
+  rateBuckets.clear();
 
   const forceExitTimer = setTimeout(() => {
     process.exit(1);
